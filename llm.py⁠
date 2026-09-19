@@ -1,0 +1,41 @@
+import requests, time
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "llama3.1:8b"
+TEMPERATURE = 0.9
+MAX_RETRIES = 3
+
+def llama_chat(prompt: str, system: str = "", temperature: float = TEMPERATURE,
+               max_tokens: int = 400) -> str:
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "format": "text",
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+            "num_ctx": 4096,
+            "repeat_penalty": 1.15,
+        },
+    }
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.post(OLLAMA_URL, json=payload, timeout=180)
+            r.raise_for_status()
+            text = r.json()["response"].strip()
+            if text:
+                return _clean(text)
+        except requests.RequestException:
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"Ollama non raggiungibile su {OLLAMA_URL}. Avvialo con: ollama serve")
+
+def _clean(text: str) -> str:
+    for prefix in ["Ecco", "Certo", "Sure", "Here's", "Sure!", "Certamente"]:
+        if text.startswith(prefix) and len(text.split("\n")) > 1:
+            text = "\n".join(text.split("\n")[1:])
+    text = text.replace("**", "").replace("#", "").strip()
+    if len(text) > 2 and text[0] in "\"«“" and text[-1] in "\"»”":
+        text = text[1:-1].strip()
+    return text
