@@ -1,0 +1,113 @@
+import time, random, datetime, zoneinfo, config, db, intelligence
+import scriptwriter, tts_engine, transcriber, assets, director, publisher, analytics, quota_manager
+from llm import llama_chat
+
+def optimal_publish_time() -> datetime.datetime:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidates = []
+    for tz in config.CPM_TIMEZONES:
+        zone = zoneinfo.ZoneInfo(tz)
+        local_now = now.astimezone(zone)
+        target = local_now.replace(hour=19, minute=30, second=0, microsecond=0)
+        if target <= local_now:
+            target += datetime.timedelta(days=1)
+        candidates.append(target.astimezone(datetime.timezone.utc))
+    return min(candidates)
+
+def run_cycle():
+    safe_files = ["music.mp3", "PROMPT_PER_AI.txt"]
+    for d in [config.DIRS["ai_assets"], config.DIRS["broll"], 
+              config.DIRS["output"], config.DIRS["audio"], config.DIRS["subs"]]:
+        for f in d.glob("*"):
+            if f.is_file() and f.name not in safe_files and f.suffix != ".txt":
+                f.unlink()
+
+    yt = intelligence.youtube()
+    niche = config.NICHES[0]
+
+    outliers = intelligence.find_outliers(yt, niche)
+    if not outliers: return True
+    
+    outlier = outliers[0]
+    arm = db.bandit_pull(intelligence.HOOK_TEMPLATES)
+    seed = random.randint(0, 2**31)
+
+    llama_chat("warmup", max_tokens=5)
+    script = scriptwriter.build_script(niche, outlier["description"], arm, seed)
+    titles = intelligence.generate_titles(yt, outlier)
+
+    tts_engine.narrate(script)
+    transcriber.generate_subs()
+    
+    voice_dur = director.get_duration(config.DIRS["audio"] / "voice.wav")
+    if voice_dur > 59.0:
+        db.log_experiment(hook_template=arm, seed=seed, prompt_version="v3", status="rejected_too_long")
+        return False 
+
+    assets.human_in_the_loop_prompt(script)
+    print(f">>> GENERA gli asset in {config.DIRS['ai_assets']}/ e metti music.mp3 in {config.DIRS['audio']}/")
+    while not assets.assets_ready() or not (config.DIRS["audio"] / "music.mp3").exists():
+        time.sleep(60)
+
+    assets.download_broll(niche.replace("-", " "))
+    timeline = []
+    for i, img in enumerate(sorted(config.DIRS["ai_assets"].glob("SHOT_*"))):
+        out = config.DIRS["output"] / f"kb_{i}.mp4"
+        director.ken_burns(img, out)
+        timeline.append(out)
+    for clip in sorted(config.DIRS["broll"].glob("*.mp4")):
+        out = config.DIRS["output"] / f"crop_{clip.stem}.mp4"
+        director.smart_crop(clip, out)
+        timeline.append(out)
+        
+    final = director.compose(timeline[:10], config.DIRS["audio"] / "voice.wav",
+                             config.DIRS["audio"] / "music.mp3",
+                             config.DIRS["subs"] / "subs.ass",
+                             config.DIRS["output"] / "final.mp4")
+
+    vid = publisher.upload_private(yt, final, titles[0], f"{script['hook']}\n\n#shorts #{niche.replace('-', '')}")
+    
+    # FIX: Anti-Zombie Video - Registro l'ID immediatamente in DB per non perderlo in caso di crash rete
+    db.log_experiment(video_id=vid, hook_template=arm, seed=seed, prompt_version="v3", 
+                      title_variant=titles[0], status="uploaded")
+
+    publisher.set_ai_disclosure(yt, vid)
+
+    if publisher.content_id_clear(yt, vid):
+        publish_time = optimal_publish_time()
+        publisher.schedule_public(yt, vid, publish_time)
+        db.update_result(vid, status="scheduled", ts=publish_time.timestamp())
+    else:
+        db.update_result(vid, status="content_id_blocked")
+
+    yt_analytics = intelligence.youtube_analytics()
+    for exp in db.all("status='scheduled'"):
+        age = time.time() - exp["ts"]
+        if age > 48 * 3600 and not exp["retention_3s"]:
+            try:
+                analytics.evaluate(yt_analytics, exp["video_id"], channel_id=config.YT_CHANNEL_ID, ts=exp["ts"])
+                db.update_result(exp["video_id"], status="learned")
+            except analytics.DataNotReady:
+                continue
+            except quota_manager.QuotaExhausted:
+                break
+                
+    return True
+
+if __name__ == "__main__":
+    while True:
+        try:
+            success = run_cycle()
+            if success is False:
+                time.sleep(10)
+                continue
+        except quota_manager.QuotaExhausted as e:
+            print(e, "— attendo reset quota (mezzanotte PT)")
+            now = datetime.datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles"))
+            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+            time.sleep((tomorrow - now).total_seconds() + 60)
+            continue
+        except Exception as e:
+            print("Errore ciclo:", e)
+            
+        time.sleep(6 * 3600)
