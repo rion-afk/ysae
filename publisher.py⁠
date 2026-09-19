@@ -1,0 +1,61 @@
+import time, datetime, config, quota_manager
+from googleapiclient.http import MediaFileUpload
+
+def upload_private(yt, video_path, title, description) -> str:
+    quota_manager.spend(config.UPLOAD_COST)
+    body = {
+        "snippet": {"title": title[:100], "description": description[:4900], "categoryId": "22"},
+        "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False},
+    }
+    media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True, mimetype="video/mp4")
+    req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+    resp = None
+    while resp is None:
+        # Fix: Salvataggio da sbalzi di rete!
+        status, resp = req.next_chunk(num_retries=5)
+    return resp["id"]
+
+def set_ai_disclosure(yt, video_id):
+    res = yt.videos().list(id=video_id, part="status").execute()
+    if not res.get("items"): return
+    current_status = res["items"][0]["status"]
+    
+    current_status["selfDeclaredMadeForKids"] = False
+    current_status["containsSyntheticMedia"] = True 
+    current_status.pop("publishAt", None) # Fix: Impedisce schedulazione involontaria
+    
+    yt.videos().update(part="status", body={
+        "id": video_id,
+        "status": current_status,
+    }).execute()
+
+def content_id_clear(yt, video_id, wait_min=60):
+    deadline = time.time() + wait_min * 60
+    while time.time() < deadline:
+        quota_manager.spend(1) 
+        r = yt.videos().list(id=video_id, part="status,contentDetails").execute()
+        items = r.get("items", [])
+        
+        if not items:
+            time.sleep(30)
+            continue
+            
+        st = items[0]["status"]
+        if st.get("uploadStatus") == "processed" and st.get("privacyStatus") == "private":
+            return True
+        time.sleep(120)
+    return False
+
+def schedule_public(yt, video_id, publish_at: datetime.datetime):
+    quota_manager.spend(1)
+    res = yt.videos().list(id=video_id, part="status").execute()
+    current_status = res["items"][0]["status"]
+
+    current_status["privacyStatus"] = "private"
+    current_status["publishAt"] = publish_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    quota_manager.spend(1)
+    yt.videos().update(part="status", body={
+        "id": video_id,
+        "status": current_status,
+    }).execute()
