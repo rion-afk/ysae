@@ -1,0 +1,10 @@
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.0
+coqui-tts>=0.22
+opencv-python>=4.9
+numpy
+pillow
+faster-whisper
+requests
+python-dotenv
+tzdata
